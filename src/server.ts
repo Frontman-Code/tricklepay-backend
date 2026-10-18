@@ -59,6 +59,9 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
     // satisfies that interface at runtime.
     loggerInstance: logger as FastifyBaseLogger,
     bodyLimit: config?.bodyLimit,
+    connectionTimeout: config?.connectionTimeoutMs,
+    keepAliveTimeout: config?.keepAliveTimeoutMs,
+    requestTimeout: config?.requestTimeoutMs,
     // Forwarded headers (X-Forwarded-For, X-Forwarded-Proto) are honored only
     // when the direct connection peer is an explicitly trusted proxy (#75).
     // Without configuration the socket address is used as-is, so a direct

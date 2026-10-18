@@ -69,6 +69,14 @@ export const DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS = 2_000;
 export const DEFAULT_RATE_LIMIT_MAX = 100;
 export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
 
+// Default server timeouts to protect against slow or stalled clients.
+// connectionTimeout: maximum time to receive entire request (headers + body)
+// keepAliveTimeout: idle time before closing keep-alive connections
+// requestTimeout: maximum time to complete request processing and send response
+export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+export const DEFAULT_KEEP_ALIVE_TIMEOUT_MS = 72_000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
 function positiveInteger(name: string, fallback: number, min: number): number {
   const raw = process.env[name];
   if (!raw || raw.trim() === "") return fallback;
@@ -165,6 +173,9 @@ export interface Config {
   readonly trustedProxies: readonly string[];
   readonly rateLimitMax?: number;
   readonly rateLimitWindowMs?: number;
+  readonly connectionTimeoutMs: number;
+  readonly keepAliveTimeoutMs: number;
+  readonly requestTimeoutMs: number;
 }
 
 export function loadConfig(): Config {
@@ -219,5 +230,8 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     rateLimitMax,
     rateLimitWindowMs,
+    connectionTimeoutMs: integer("CONNECTION_TIMEOUT_MS", DEFAULT_CONNECTION_TIMEOUT_MS),
+    keepAliveTimeoutMs: integer("KEEP_ALIVE_TIMEOUT_MS", DEFAULT_KEEP_ALIVE_TIMEOUT_MS),
+    requestTimeoutMs: integer("REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
   };
 }
