@@ -404,6 +404,22 @@ export async function streamRoutes(
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
+      
+      // Add Link header for next page (RFC 8288)
+      if (listResult.nextCursor !== undefined) {
+        const url = new URL(request.url, `${request.protocol}://${request.hostname}`);
+        url.searchParams.set('cursor', listResult.nextCursor);
+        url.searchParams.set('limit', limit.toString());
+        // Preserve existing filters
+        for (const field of ["sender", "recipient", "token", "cancelled", "includeTotal"] as const) {
+          const value = query[field];
+          if (value !== undefined) {
+            url.searchParams.set(field, value);
+          }
+        }
+        reply.header("Link", `<${url.toString()}>; rel="next"`);
+      }
+      
       return {
         streams: listResult.streams.map((s) => mapStreamResponse(s)),
         ...(total === undefined ? {} : { total }),
