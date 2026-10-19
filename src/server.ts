@@ -37,6 +37,8 @@ import { REQUEST_ID_HEADER, sanitizeRequestId } from "./request-id.js";
 
 import { registerRequestIdHook } from "./request-id-hook.js";
 
+import { registerIndexerLagHook } from "./indexer-lag-hook.js";
+
 import { registerSharedSchemas } from "./schemas.js";
 
 // Request-id sanitisation lives in `./request-id.ts`, the echo hook in
@@ -138,6 +140,9 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
 
   // Echo the request id header on every response.
   registerRequestIdHook(app);
+
+  // Add X-Indexer-Lag-Ledgers header to read responses.
+  registerIndexerLagHook(app);
 
   // Record every response against the Prometheus counters and histograms.
   await registerMetricsPlugin(app);
