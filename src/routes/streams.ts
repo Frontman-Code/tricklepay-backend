@@ -1,5 +1,7 @@
-// Registers the GET /streams, GET /streams/summary, GET /streams/:id/events, and GET /streams/:id endpoints.
+// Registers the GET /streams, GET /streams/summary, GET /tokens, GET /streams/:id/events, and GET /streams/:id endpoints.
 // These routes read stream records, historical events, and aggregations from the database.
+
+import { createHash } from "node:crypto";
 
 import { Prisma, type Stream } from "@prisma/client";
 
@@ -10,16 +12,24 @@ import type { FastifyInstance } from "fastify";
 import { sendError, bigIntToStringNullable } from "../lib/response.js";
 import { parsePagination } from "../lib/pagination.js";
 import { mapStreamResponse } from "../lib/stream-view.js";
+import { MAX_UINT64, parseStreamId } from "../lib/stream-id.js";
 
 import {
   aggregateStreams,
   countStreams,
   decodeCursor,
+  getAccountStreams,
   getStream,
   listStreams,
+  listTokens,
+  statusWhere,
 } from "../repositories/streams.js";
 
 import {
+  ACCOUNT_STREAM_SUMMARY_SCHEMA_ID,
+  ACCOUNT_SUMMARY_RESPONSE_SCHEMA_ID,
+  accountStreamSummarySchema,
+  accountSummaryResponseSchema,
   apiErrorSchema,
   ERROR_SCHEMA_ID,
   streamEventHistoryResponseSchema,
@@ -28,18 +38,36 @@ import {
   STREAM_EVENT_SCHEMA_ID,
   streamListResponseSchema,
   STREAM_LIST_RESPONSE_SCHEMA_ID,
+  streamScheduleResponseSchema,
+  STREAM_SCHEDULE_RESPONSE_SCHEMA_ID,
   streamSummaryResponseSchema,
   STREAM_SUMMARY_RESPONSE_SCHEMA_ID,
   streamViewSchema,
   STREAM_VIEW_SCHEMA_ID,
+  TOKEN_LIST_RESPONSE_SCHEMA_ID,
+  TOKEN_SUMMARY_SCHEMA_ID,
+  tokenListResponseSchema,
+  tokenSummarySchema,
 } from "../schema.js";
-import { listIndexedEvents } from "../repositories/indexed-events.js";
+import { listIndexedEvents, type IndexedEventKind } from "../repositories/indexed-events.js";
+import { normalizeAddress } from "../lib/address.js";
 import { nowSeconds } from "../lib/time.js";
+import { vestedAmount, withdrawableAmount } from "../lib/vesting.js";
 import { DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS } from "../config.js";
 
 // Above this offset a scan gets expensive enough that callers should page
 // through results in order or narrow them with filters instead.
 const MAX_OFFSET = 10000;
+
+// Weak ETag for list responses, derived from the serialized body so it changes
+// whenever any returned field changes (streams, total, nextCursor, pagination).
+// "Weak" (W/) is correct here: the body is byte-identical between revalidations
+// for the same data, but we only guarantee semantic equivalence, matching the
+// detail route's revalidation model without a per-row version column.
+function weakEtagFromBody(body: unknown): string {
+  const digest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+  return `W/"${digest}"`;
+}
 
 type StreamStatus = "pending" | "streaming" | "completed" | "cancelled";
 
@@ -47,9 +75,7 @@ function parseIncludeTotal(raw: string | undefined): boolean {
   return raw === "true";
 }
 
-const MAX_UINT64 = 18446744073709551615n;
-
-function parseStreamId(raw: string | undefined): bigint | null {
+function parseAtTimestamp(raw: string | undefined): bigint | null {
   if (raw === undefined) return null;
 
   const value = raw.trim();
@@ -64,23 +90,70 @@ function parseStreamId(raw: string | undefined): bigint | null {
   }
 }
 
+const DEFAULT_SCHEDULE_POINTS = 50;
+const MIN_SCHEDULE_POINTS = 2;
+const MAX_SCHEDULE_POINTS = 100;
+
+function computeSchedulePoints(stream: Stream, targetPoints = DEFAULT_SCHEDULE_POINTS) {
+  const count = Math.max(MIN_SCHEDULE_POINTS, Math.min(targetPoints, MAX_SCHEDULE_POINTS));
+  const startTime = stream.startTime;
+  const endTime = stream.endTime;
+  const cliffTime = stream.cliffTime;
+  const total = BigInt(stream.totalAmount.toString());
+
+  if (endTime <= startTime) {
+    const v = vestedAmount(total, startTime, endTime, cliffTime, startTime);
+    return [
+      {
+        time: startTime.toString(),
+        amount: v.toString(),
+        vested: v.toString(),
+      },
+    ];
+  }
+
+  const duration = endTime - startTime;
+  const hasCliff = cliffTime > startTime && cliffTime < endTime;
+
+  const candidateTimes = new Set<bigint>();
+  for (let i = 0; i < count; i++) {
+    const t = startTime + (duration * BigInt(i)) / BigInt(count - 1);
+    candidateTimes.add(t);
+  }
+
+  if (hasCliff && !candidateTimes.has(cliffTime)) {
+    let closest: bigint | null = null;
+    let minDiff: bigint | null = null;
+    for (const t of candidateTimes) {
+      if (t === startTime || t === endTime) continue;
+      const diff = t > cliffTime ? t - cliffTime : cliffTime - t;
+      if (minDiff === null || diff < minDiff) {
+        minDiff = diff;
+        closest = t;
+      }
+    }
+    if (closest !== null) {
+      candidateTimes.delete(closest);
+    }
+    candidateTimes.add(cliffTime);
+  }
+
+  const sortedTimes = Array.from(candidateTimes).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  return sortedTimes.map((t) => {
+    const v = vestedAmount(total, startTime, endTime, cliffTime, t);
+    return {
+      time: t.toString(),
+      amount: v.toString(),
+      vested: v.toString(),
+    };
+  });
+}
+
 function parseCancelled(raw: string | undefined): boolean | undefined {
   if (raw === "true") return true;
   if (raw === "false") return false;
   return undefined;
-}
-
-// Stellar addresses are canonical uppercase base32 strkeys, but callers
-// sometimes send lowercase or whitespace-padded spellings. Normalize those
-// before matching so every rendering of one address filters identically, and
-// reject values that are neither a valid account nor a valid contract address.
-// Returns null when the input cannot be normalized safely.
-function normalizeAddress(raw: string): string | null {
-  const candidate = raw.trim().toUpperCase();
-  if (StrKey.isValidEd25519PublicKey(candidate) || StrKey.isValidContract(candidate)) {
-    return candidate;
-  }
-  return null;
 }
 
 const SUMMARY_STATUSES = ["pending", "streaming", "completed", "cancelled"] as const;
@@ -88,23 +161,56 @@ const SUMMARY_STATUSES = ["pending", "streaming", "completed", "cancelled"] as c
 type SummaryEntry = { count: number; totalAmount: string; withdrawn: string };
 type SummaryPayload = Record<StreamStatus, SummaryEntry>;
 
+function summarizeAccountStreams(streams: Stream[], now: bigint) {
+  let totalAmount = 0n;
+  let withdrawn = 0n;
+  let vested = 0n;
+  let withdrawable = 0n;
+
+  for (const stream of streams) {
+    const streamTotal = BigInt(stream.totalAmount.toString());
+    const streamWithdrawn = BigInt(stream.withdrawn.toString());
+    const streamVested = vestedAmount(
+      streamTotal,
+      stream.startTime,
+      stream.endTime,
+      stream.cliffTime,
+      now,
+    );
+    const streamWithdrawable = withdrawableAmount(streamVested, streamWithdrawn);
+
+    totalAmount += streamTotal;
+    withdrawn += streamWithdrawn;
+    vested += streamVested;
+    withdrawable += streamWithdrawable;
+  }
+
+  return {
+    count: streams.length,
+    totalAmount: totalAmount.toString(),
+    total: totalAmount.toString(),
+    withdrawn: withdrawn.toString(),
+    vested: vested.toString(),
+    withdrawable: withdrawable.toString(),
+  };
+}
+
 export type StreamRoutesOptions = {
   summaryCacheTtlMs?: number;
 };
 
-// The database-side predicate for each lifecycle status, mirroring `statusOf`:
-// cancelled wins first, then the start/end time windows against the clock.
-function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhereInput {
-  switch (status) {
-    case "cancelled":
-      return { cancelled: true };
-    case "pending":
-      return { cancelled: false, startTime: { gt: now } };
-    case "completed":
-      return { cancelled: false, endTime: { lte: now } };
-    case "streaming":
-      return { cancelled: false, startTime: { lte: now }, endTime: { gt: now } };
-  }
+// Mirrors the `querystring` JSON schema on GET /streams below field for
+// field, so a parameter renamed in one place without the other is a compile
+// error instead of a silently-undefined value at runtime.
+interface ListStreamsQuery {
+  sender?: string;
+  recipient?: string;
+  token?: string;
+  limit?: string;
+  offset?: string;
+  includeTotal?: string;
+  cancelled?: string;
+  cursor?: string;
 }
 
 export async function streamRoutes(
@@ -127,9 +233,24 @@ export async function streamRoutes(
   if (!app.getSchema(STREAM_EVENT_HISTORY_RESPONSE_SCHEMA_ID)) {
     app.addSchema(streamEventHistoryResponseSchema);
   }
+  if (!app.getSchema(TOKEN_SUMMARY_SCHEMA_ID)) {
+    app.addSchema(tokenSummarySchema);
+  }
+  if (!app.getSchema(TOKEN_LIST_RESPONSE_SCHEMA_ID)) {
+    app.addSchema(tokenListResponseSchema);
+  }
+  if (!app.getSchema(ACCOUNT_STREAM_SUMMARY_SCHEMA_ID)) {
+    app.addSchema(accountStreamSummarySchema);
+  }
+  if (!app.getSchema(ACCOUNT_SUMMARY_RESPONSE_SCHEMA_ID)) {
+    app.addSchema(accountSummaryResponseSchema);
+  }
+  if (!app.getSchema(STREAM_SCHEDULE_RESPONSE_SCHEMA_ID)) {
+    app.addSchema(streamScheduleResponseSchema);
+  }
   if (!app.getSchema(ERROR_SCHEMA_ID)) app.addSchema(apiErrorSchema);
 
-  app.get(
+  app.get<{ Querystring: ListStreamsQuery }>(
     "/streams",
     {
       schema: {
@@ -142,7 +263,8 @@ export async function streamRoutes(
           "Results are returned in a stable deterministic order: when filtering by sender, recipient, or token, " +
           "results are ordered by that address ascending, then by stream id descending to break ties. " +
           "Unfiltered queries (or queries filtered only by cancellation status) are ordered by stream id descending. " +
-          "Stream id is the final tie-breaker in all cases so pagination is cacheable and repeatable.",
+          "Stream id is the final tie-breaker in all cases so pagination is cacheable and repeatable. " +
+          "Responses carry a weak ETag derived from the body; send it back as If-None-Match to get a 304 with no body when nothing changed.",
         tags: ["streams"],
         querystring: {
           type: "object",
@@ -200,21 +322,13 @@ export async function streamRoutes(
         },
         response: {
           200: { $ref: STREAM_LIST_RESPONSE_SCHEMA_ID },
+          304: { type: "null" },
           400: { $ref: ERROR_SCHEMA_ID },
         },
       },
     },
     async (request, reply) => {
-      const query = request.query as {
-        sender?: string;
-        recipient?: string;
-        token?: string;
-        limit?: string;
-        offset?: string;
-        includeTotal?: string;
-        cancelled?: string;
-        cursor?: string;
-      };
+      const query = request.query;
 
       const { limit, offset } = parsePagination(query);
 
@@ -267,13 +381,25 @@ export async function streamRoutes(
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
-      return {
-        streams: listResult.streams.map(mapStreamResponse),
+
+      // Built once and reused for both the ETag and the returned body so the
+      // digest is derived from exactly the bytes the client would receive.
+      const body = {
+        streams: listResult.streams.map((s) => mapStreamResponse(s)),
         ...(total === undefined ? {} : { total }),
         ...(listResult.nextCursor === undefined ? {} : { nextCursor: listResult.nextCursor }),
         limit,
         offset: usingCursor ? 0 : offset,
       };
+
+      const etag = weakEtagFromBody(body);
+      reply.header("ETag", etag);
+
+      if (request.headers["if-none-match"] === etag) {
+        return reply.code(304).send();
+      }
+
+      return body;
     },
   );
 
@@ -329,6 +455,27 @@ export async function streamRoutes(
   );
 
   app.get(
+    "/tokens",
+    {
+      schema: {
+        summary: "List distinct tokens",
+        description:
+          "Returns each distinct token with its stream count and total escrowed amount. " +
+          "Totals are aggregated in the database over decimal columns, so they never lose precision.",
+        tags: ["streams"],
+        response: {
+          200: { $ref: TOKEN_LIST_RESPONSE_SCHEMA_ID },
+        },
+      },
+    },
+    async (_request, reply) => {
+      const tokens = await listTokens();
+      reply.header("Cache-Control", "public, max-age=30");
+      return tokens;
+    },
+  );
+
+  app.get(
     "/streams/:id/events",
     {
       schema: {
@@ -348,6 +495,17 @@ export async function streamRoutes(
             },
           },
         },
+        querystring: {
+          type: "object",
+          properties: {
+            kind: {
+              type: "string",
+              enum: ["created", "withdrawn", "cancelled"],
+              description: "Filter events by kind (created, withdrawn, or cancelled).",
+            },
+          },
+          additionalProperties: false,
+        },
         response: {
           200: { $ref: STREAM_EVENT_HISTORY_RESPONSE_SCHEMA_ID },
           400: { $ref: ERROR_SCHEMA_ID },
@@ -357,9 +515,15 @@ export async function streamRoutes(
     },
     async (request, reply) => {
       const { id } = request.params as { id: string };
+      const { kind } = (request.query as { kind?: string }) ?? {};
       const streamId = parseStreamId(id);
       if (streamId === null) {
         return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id");
+      }
+
+      const validKinds: readonly string[] = ["created", "withdrawn", "cancelled"];
+      if (kind !== undefined && !validKinds.includes(kind)) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid event kind");
       }
 
       const stream = await getStream({ streamId });
@@ -367,7 +531,7 @@ export async function streamRoutes(
         return sendError(reply, request, 404, "NOT_FOUND", "stream not found");
       }
 
-      const events = await listIndexedEvents(streamId);
+      const events = await listIndexedEvents(streamId, kind as IndexedEventKind | undefined);
       reply.header("Cache-Control", "public, max-age=30");
       return events.map((event) => ({
         eventId: event.eventId,
@@ -393,6 +557,7 @@ export async function streamRoutes(
   app.get(
     "/streams/:id",
     {
+      exposeHeadRoute: true,
       schema: {
         summary: "Get stream by id",
         description: "Returns a single token stream by its numeric id.",
@@ -407,6 +572,18 @@ export async function streamRoutes(
               examples: ["42"],
             },
           },
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            at: {
+              type: "string",
+              description:
+                "Optional Unix timestamp in seconds to calculate vested/derived figures at that point in time.",
+              examples: ["1735689600"],
+            },
+          },
+          additionalProperties: false,
         },
         response: {
           200: { $ref: STREAM_VIEW_SCHEMA_ID },
@@ -423,12 +600,25 @@ export async function streamRoutes(
         return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id");
       }
 
+      const query = request.query as { at?: string };
+      let asOfTime: bigint | undefined;
+      if (query.at !== undefined) {
+        const parsed = parseAtTimestamp(query.at);
+        if (parsed === null) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid at timestamp");
+        }
+        asOfTime = parsed;
+      }
+
       const stream = await getStream({ streamId });
       if (!stream) {
         return sendError(reply, request, 404, "NOT_FOUND", "stream not found");
       }
 
-      const etag = `"${stream.updatedLedger}"`;
+      const etag =
+        asOfTime !== undefined
+          ? `"${stream.updatedLedger}-${asOfTime}"`
+          : `"${stream.updatedLedger}"`;
       reply.header("Cache-Control", "public, max-age=30");
       reply.header("ETag", etag);
 
@@ -437,7 +627,131 @@ export async function streamRoutes(
         return reply.code(304).send();
       }
 
-      return mapStreamResponse(stream);
+      return mapStreamResponse(stream, asOfTime);
+    },
+  );
+
+  app.get(
+    "/streams/:id/schedule",
+    {
+      schema: {
+        summary: "Get stream vesting schedule",
+        description:
+          "Returns evenly spaced points along the stream's vesting curve between start and end, " +
+          "with the cliff step included, suitable for client-side charting.",
+        tags: ["streams"],
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: {
+              type: "string",
+              description: "Stream id (uint64, decimal string).",
+              examples: ["42"],
+            },
+          },
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            points: {
+              type: "string",
+              description: "Desired number of schedule points (2–100, default 50).",
+              examples: ["50"],
+            },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: { $ref: STREAM_SCHEDULE_RESPONSE_SCHEMA_ID },
+          304: { type: "null" },
+          400: { $ref: ERROR_SCHEMA_ID },
+          404: { $ref: ERROR_SCHEMA_ID },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const streamId = parseStreamId(id);
+      if (streamId === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id");
+      }
+
+      const query = request.query as { points?: string; count?: string; limit?: string };
+      const rawPoints = query.points ?? query.count ?? query.limit;
+      let requestedPoints = DEFAULT_SCHEDULE_POINTS;
+      if (rawPoints !== undefined) {
+        const trimmed = rawPoints.trim();
+        if (trimmed.length === 0 || !/^\d+$/.test(trimmed)) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid points parameter");
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid points parameter");
+        }
+        requestedPoints = Math.max(MIN_SCHEDULE_POINTS, Math.min(parsed, MAX_SCHEDULE_POINTS));
+      }
+
+      const stream = await getStream({ streamId });
+      if (!stream) {
+        return sendError(reply, request, 404, "NOT_FOUND", "stream not found");
+      }
+
+      const etag = `"${stream.updatedLedger}-schedule-${requestedPoints}"`;
+      reply.header("Cache-Control", "public, max-age=30");
+      reply.header("ETag", etag);
+
+      const ifNoneMatch = request.headers["if-none-match"];
+      if (ifNoneMatch === etag) {
+        return reply.code(304).send();
+      }
+
+      const points = computeSchedulePoints(stream, requestedPoints);
+      return { points };
+    },
+  );
+
+  app.get(
+    "/accounts/:address/summary",
+    {
+      schema: {
+        summary: "Get account stream summary",
+        description:
+          "Returns incoming and outgoing stream counts and exact amount totals for a single Stellar address. " +
+          "Derived amounts (vested, withdrawable) are calculated against the current time using the same rules as the stream view.",
+        tags: ["streams"],
+        params: {
+          type: "object",
+          required: ["address"],
+          properties: {
+            address: {
+              type: "string",
+              description: "Stellar account public key or contract address.",
+              examples: ["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"],
+            },
+          },
+        },
+        response: {
+          200: { $ref: ACCOUNT_SUMMARY_RESPONSE_SCHEMA_ID },
+          400: { $ref: ERROR_SCHEMA_ID },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { address } = request.params as { address: string };
+      const normalized = normalizeAddress(address);
+      if (!normalized) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid address");
+      }
+
+      const { incoming, outgoing } = await getAccountStreams(normalized);
+      const now = nowSeconds();
+
+      reply.header("Cache-Control", "public, max-age=30");
+      return {
+        incoming: summarizeAccountStreams(incoming, now),
+        outgoing: summarizeAccountStreams(outgoing, now),
+      };
     },
   );
 }

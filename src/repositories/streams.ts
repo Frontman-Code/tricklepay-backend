@@ -285,6 +285,24 @@ export function orderByFromFilter(
   return orderBy;
 }
 
+export type StreamStatus = "pending" | "streaming" | "completed" | "cancelled";
+
+// The database-side predicate for each lifecycle status, mirroring `statusOf`
+// in src/lib/stream-view.ts: cancelled wins first, then the start/end time
+// windows against the clock.
+export function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhereInput {
+  switch (status) {
+    case "cancelled":
+      return { cancelled: true };
+    case "pending":
+      return { cancelled: false, startTime: { gt: now } };
+    case "completed":
+      return { cancelled: false, endTime: { lte: now } };
+    case "streaming":
+      return { cancelled: false, startTime: { lte: now }, endTime: { gt: now } };
+  }
+}
+
 export async function listStreams(filter: StreamFilter): Promise<StreamListResult> {
   const limit = filter.limit ?? 50;
   const useCursor = filter.cursor !== undefined;
@@ -339,3 +357,42 @@ export async function aggregateStreams(where: Prisma.StreamWhereInput): Promise<
     withdrawn: result._sum.withdrawn ?? new Prisma.Decimal(0),
   };
 }
+
+export interface TokenSummary {
+  token: string;
+  count: number;
+  total: string;
+}
+
+// Groups streams by token and returns the distinct tokens with stream count
+// and total escrowed amount. The sums run in Postgres over decimal columns so
+// amounts stay exact.
+export async function listTokens(): Promise<TokenSummary[]> {
+  const groups = await withQueryTimeout(
+    prisma.stream.groupBy({
+      by: ["token"],
+      _count: { streamId: true },
+      _sum: { totalAmount: true },
+      orderBy: { token: "asc" },
+    }),
+  );
+
+  return groups.map((group) => ({
+    token: group.token,
+    count: group._count.streamId,
+    total: group._sum.totalAmount ? group._sum.totalAmount.toString() : "0",
+  }));
+}
+
+// Returns incoming (recipient = address) and outgoing (sender = address) streams
+// for a single Stellar account or contract address.
+export async function getAccountStreams(
+  address: string,
+): Promise<{ incoming: Stream[]; outgoing: Stream[] }> {
+  const [incoming, outgoing] = await Promise.all([
+    withQueryTimeout(prisma.stream.findMany({ where: { recipient: address } })),
+    withQueryTimeout(prisma.stream.findMany({ where: { sender: address } })),
+  ]);
+  return { incoming, outgoing };
+}
+
