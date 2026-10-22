@@ -44,7 +44,7 @@ sender, recipient, token, total, and the `startTime`/`endTime`/`cliffTime`
 schedule, with `withdrawn` at zero and `cancelled` false by definition — while
 `Withdrawn` and `Cancelled` carry the deltas that move one. So the indexer
 writes each event straight to Postgres: one query per event and no chain
-round-trip. That is what makes a backfill cheap, since an historical event costs
+round-trip. That is what makes a backfill so cheap, since an historical event costs
 a database write rather than an RPC simulation.
 
 Applying an event twice therefore has to be harmless, because the indexer saves
