@@ -311,6 +311,13 @@ export async function streamRoutes(
               description:
                 "Filter by cancellation status. Omit to return both cancelled and active streams.",
             },
+            status: {
+              type: "string",
+              enum: ["pending", "streaming", "completed", "cancelled"],
+              description:
+                "Filter by lifecycle status. pending: not yet started, streaming: currently active, " +
+                "completed: ended naturally, cancelled: terminated early. Combines with other filters.",
+            },
             cursor: {
               type: "string",
               description:
@@ -358,6 +365,7 @@ export async function streamRoutes(
         recipient?: string;
         token?: string;
         cancelled?: boolean;
+        status?: "pending" | "streaming" | "completed" | "cancelled";
         cursor?: bigint;
       } = {};
       for (const field of ["sender", "recipient", "token"] as const) {
@@ -371,13 +379,25 @@ export async function streamRoutes(
       }
 
       filter.cancelled = parseCancelled(query.cancelled);
+      
+      // Parse and validate status filter
+      if (query.status) {
+        const status = query.status;
+        if (status !== "pending" && status !== "streaming" && status !== "completed" && status !== "cancelled") {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "status must be one of: pending, streaming, completed, cancelled");
+        }
+        filter.status = status;
+      }
+      
       filter.cursor = cursor;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
+      
+      const now = nowSeconds();
 
       const [listResult, total] = await Promise.all([
-        listStreams({ ...filter, limit, offset }),
-        includeTotal ? countStreams(filter) : Promise.resolve(undefined),
+        listStreams({ ...filter, limit, offset }, now),
+        includeTotal ? countStreams(filter, now) : Promise.resolve(undefined),
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
