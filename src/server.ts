@@ -187,14 +187,24 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
   // every error response.
   registerErrorHandlers(app);
 
+  const configuredCorsOrigin = process.env.CORS_ORIGIN?.trim();
+  const corsOrigin =
+    configuredCorsOrigin === undefined
+      ? true
+      : configuredCorsOrigin === ""
+        ? false
+        : configuredCorsOrigin;
+
   // The web client fetches this API from the browser, so it is always a
   // cross-origin caller once the two run on separate ports or hosts. The data
   // served here is public and read-only, so any origin is reflected by
-  // default; set CORS_ORIGIN to pin deployments to a known frontend. Not
-  // awaited because Fastify defers plugin loading until ready/listen, which
-  // keeps this builder synchronous for its callers.
+  // default; set CORS_ORIGIN to pin deployments to a known frontend. A blank
+  // value disables browser access altogether, rather than passing an empty
+  // origin string through to the CORS plugin. Not awaited because Fastify
+  // defers plugin loading until ready/listen, which keeps this builder
+  // synchronous for its callers.
   void app.register(cors, {
-    origin: process.env.CORS_ORIGIN ?? true,
+    origin: corsOrigin,
   });
 
   // Compress responses at or above the configured threshold when the client
